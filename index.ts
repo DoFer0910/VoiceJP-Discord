@@ -23,6 +23,7 @@ import {
 
 import nrCheck from "./includes/blocked_user_check";
 import generateVoice from "./includes/speech";
+import { createWhisperRecognitionSession } from "./includes/whisper_recognition";
 import FillSilenceStream from "./models/fill_silence_stream";
 
 dotenv.config();
@@ -142,6 +143,14 @@ const soundEffects = {
 };
 const voiceChannels = new Map();
 
+type RecognitionEngine = "vosk" | "whisper";
+
+interface RecognitionSession {
+    member: GuildMember;
+    webhook: Webhook;
+    dispose: () => Promise<void>;
+}
+
 function setActivity() {
     client.user?.setActivity({
         "name": `/help | ${client.guilds.cache.size}servers | joining ${voiceChannels.size}channels | ${client.ws.ping}ms`,
@@ -228,6 +237,16 @@ client.on("ready", async () => {
                             .setName("recognition")
                             .setDescription("set recognition.")
                             .setDescriptionLocalization("ja", "音声認識を設定します。")
+                            .addStringOption(
+                                new SlashCommandStringOption()
+                                    .setName("engine")
+                                    .setDescription("select recognition engine.")
+                                    .setDescriptionLocalization("ja", "使用する音声認識エンジンを選択します。")
+                                    .setChoices(
+                                        { name: "Vosk", value: "vosk" },
+                                        { name: "Whisper", value: "whisper" }
+                                    )
+                            )
                     )
             ]
         });
@@ -242,6 +261,7 @@ client.on("ready", async () => {
 async function disableVoice(guildId: string) {
     if (!voiceChannels.has(guildId)) return;
     clearInterval(voiceChannels.get(guildId).checker);
+    await disableSpeechRecognition(guildId);
     await disableSpeechSynthesis(guildId);
     voiceChannels.get(guildId).connection.destroy();
     voiceChannels.delete(guildId);
@@ -254,10 +274,15 @@ async function disableSpeechSynthesis(guildId: string) {
 }
 async function disableSpeechRecognition(guildId: string) {
     if (!voiceChannels.has(guildId) || !voiceChannels.get(guildId).recognition) return;
-    await Promise.all(voiceChannels.get(guildId).recognition.recognizing.map(async (recognizingMember: { member: GuildMember; }) => {
-        await removeSpeechRecognizeMember(recognizingMember.member, guildId);
+    const recognitionState = voiceChannels.get(guildId).recognition;
+    await Promise.all(recognitionState.recognizing.map(async (session: RecognitionSession) => {
+        try {
+            await session.dispose();
+        } catch (error) {
+            console.error("[recognition] Failed to dispose session", error);
+        }
     }));
-    client.off("voiceStateUpdate", voiceChannels.get(guildId).recognition.onVoiceStateUpdate);
+    client.off("voiceStateUpdate", recognitionState.onVoiceStateUpdate);
     voiceChannels.get(guildId).recognition = null;
 }
 
@@ -344,7 +369,7 @@ interactionCommands.set("join", async (interaction: ChatInputCommandInteraction)
     });
     const player = createAudioPlayer();
     connection.subscribe(player);
-    voiceChannels.set(interaction.guildId as string, { connection, player, channel });
+    voiceChannels.set(interaction.guildId as string, { connection, player, channel, synthesis: null, recognition: null });
     connection.on(VoiceConnectionStatus.Ready, () => {
         player.play(soundEffects.join());
         const checker = setInterval(async () => {
@@ -396,47 +421,76 @@ interactionCommands.set("leave", async (interaction: ChatInputCommandInteraction
     });
 });
 
-async function addSpeechRecognizeMember(member: GuildMember, guildId: string, channel: BaseGuildTextChannel) {
+async function createVoskRecognitionSession(member: GuildMember, guildId: string, channel: BaseGuildTextChannel): Promise<RecognitionSession> {
+    const state = voiceChannels.get(guildId);
+    if (!state) throw new Error("Voice channel state not found");
+    const connection = state.connection;
     const webhook = await channel.createWebhook({
         name: `${member.displayName}[VoiceJP]`,
         avatar: member.user.displayAvatarURL({ "extension": "png", "size": 1024, "forceStatic": false }),
-        reason: "VoiceJP Voice Recognition"
+        reason: "VoiceJP Voice Recognition",
     });
-    const voice = voiceChannels.get(guildId).connection.receiver.subscribe(member.id, {
-        end: {
-            behavior: EndBehaviorType.Manual
-        },
 
+    const voice = connection.receiver.subscribe(member.id, {
+        end: {
+            behavior: EndBehaviorType.Manual,
+        },
     }).pipe(new prism.opus.Decoder({ rate: 48000, channels: 1, frameSize: 960 }));
+
     const recognizer = new vosk.Recognizer({
         model: voskModel,
         sampleRate: 48000,
     });
     const filledSilence = new FillSilenceStream();
     voice.pipe(filledSilence);
-    filledSilence.on("data", async (data: Buffer) => {
-        if (recognizer.acceptWaveform(data)) {
-            const result = recognizer.result().text.replace(/ /g, "").replace(/。/g, "。\n").trim();
-            if (result === "") return;
-            webhook.send(result.slice(0, 1000) + (result.length > 1000 ? "…" : ""));
-        }
-    });
+
+    const handleData = (data: Buffer) => {
+        if (!recognizer.acceptWaveform(data)) return;
+        const result = recognizer.result().text.replace(/ /g, "").replace(/。/g, "。\n").trim();
+        if (result === "") return;
+        const message = result.slice(0, 1000) + (result.length > 1000 ? "…" : "");
+        void webhook.send(message).catch((error) => console.error("[vosk] Failed to send transcription", error));
+    };
+
+    filledSilence.on("data", handleData);
+
     return {
+        member,
         webhook,
-        recognizer,
-        voice,
-        filledSilence
+        dispose: async () => {
+            filledSilence.off("data", handleData);
+            filledSilence.destroy();
+            recognizer.free();
+            voice.destroy();
+            await webhook.delete().catch(() => undefined);
+        },
     };
 }
 
-async function removeSpeechRecognizeMember(member: GuildMember, guildId: string) {
-    const recognizingMember = voiceChannels.get(guildId).recognition.recognizing.find((recognizing: { member: GuildMember }) => recognizing.member.id === member.id);
-    if (!recognizingMember) return;
-    recognizingMember.webhook.delete();
-    recognizingMember.filledSilence.destroy();
-    recognizingMember.recognizer.free();
-    recognizingMember.voice.destroy();
-    voiceChannels.get(guildId).recognition.recognizing.splice(voiceChannels.get(guildId).recognition.recognizing.indexOf(recognizingMember), 1);
+async function createRecognitionSession(engine: RecognitionEngine, member: GuildMember, guildId: string, channel: BaseGuildTextChannel): Promise<RecognitionSession> {
+    const state = voiceChannels.get(guildId);
+    if (!state) throw new Error("Voice channel state not found");
+
+    if (engine === "whisper") {
+        return createWhisperRecognitionSession({
+            connection: state.connection,
+            guildId,
+            member,
+            channel,
+        });
+    }
+
+    return createVoskRecognitionSession(member, guildId, channel);
+}
+
+async function removeRecognitionMember(guildId: string, memberId?: string) {
+    if (!memberId) return;
+    const recognitionState = voiceChannels.get(guildId)?.recognition;
+    if (!recognitionState) return;
+    const sessionIndex = recognitionState.recognizing.findIndex((session: RecognitionSession) => session.member.id === memberId);
+    if (sessionIndex === -1) return;
+    const [session] = recognitionState.recognizing.splice(sessionIndex, 1);
+    await session.dispose();
 }
 
 interactionCommands.set("speech", async (interaction: ChatInputCommandInteraction) => {
@@ -525,9 +579,11 @@ interactionCommands.set("speech", async (interaction: ChatInputCommandInteractio
             }]
         });
     } else if (subCommand === "recognition") {
-        if (voiceChannels.get(interaction.guildId as string).recognition) {
+        const engine = (interaction.options.getString("engine") as RecognitionEngine | null) ?? "vosk";
+        const state = voiceChannels.get(interaction.guildId as string);
+        if (state.recognition) {
             await disableSpeechRecognition(interaction.guildId as string);
-            voiceChannels.get(interaction.guildId as string).player.play(soundEffects.disable());
+            state.player.play(soundEffects.disable());
             await interaction.reply({
                 "content": "音声認識を解除しました。",
                 "embeds": [{
@@ -538,13 +594,14 @@ interactionCommands.set("speech", async (interaction: ChatInputCommandInteractio
             });
             return;
         }
-        const recognitionMembers = new Map<string, GuildMember>();
-        voiceChannels.get(interaction.guildId as string).channel.members.forEach((member: GuildMember) => {
+
+        const recognitionMembers: GuildMember[] = [];
+        state.channel.members.forEach((member: GuildMember) => {
             if (member.user.bot) return;
-            recognitionMembers.set(member.id, member);
+            recognitionMembers.push(member);
         });
-        const recognizing: { member: GuildMember; webhook: Webhook; recognizer: vosk.Recognizer<(vosk.Without<vosk.SpeakerRecognizerParam, Partial<vosk.GrammarRecognizerParam>> & Partial<vosk.GrammarRecognizerParam>) | (vosk.Without<Partial<vosk.GrammarRecognizerParam>, vosk.SpeakerRecognizerParam> & vosk.SpeakerRecognizerParam)>; voice: prism.opus.Decoder; filledSilence: FillSilenceStream; }[] = [];
-        if (recognitionMembers.size > 10) {
+
+        if (recognitionMembers.length > 10) {
             await interaction.reply({
                 "content": "エラーが発生しました。",
                 "embeds": [{
@@ -556,37 +613,60 @@ interactionCommands.set("speech", async (interaction: ChatInputCommandInteractio
             });
             return;
         }
-        recognitionMembers.forEach(async (member: GuildMember) => {
-            if ((await (interaction.channel as BaseGuildTextChannel).fetchWebhooks()).size >= 10) {
-                await interaction.reply({
-                    "content": "エラーが発生しました。",
-                    "embeds": [{
-                        "title": "エラー",
-                        "description": "Webhookの上限に達しました。",
-                        "color": Colors.Red
-                    }],
-                    "ephemeral": true
-                });
-                return;
-            }
-            const { webhook, recognizer, voice, filledSilence } = await addSpeechRecognizeMember(member, interaction.guildId as string, interaction.channel as BaseGuildTextChannel);
-            recognizing.push({
-                member,
-                webhook,
-                recognizer,
-                voice,
-                filledSilence
+
+        const textChannel = interaction.channel as BaseGuildTextChannel;
+        const existingWebhooks = await textChannel.fetchWebhooks();
+        if (existingWebhooks.size + recognitionMembers.length > 10) {
+            await interaction.reply({
+                "content": "エラーが発生しました。",
+                "embeds": [{
+                    "title": "エラー",
+                    "description": "Webhookの上限に達しました。",
+                    "color": Colors.Red
+                }],
+                "ephemeral": true
             });
-        });
+            return;
+        }
+
+        const recognizing: RecognitionSession[] = [];
+        try {
+            for (const member of recognitionMembers) {
+                const session = await createRecognitionSession(engine, member, interaction.guildId as string, textChannel);
+                recognizing.push(session);
+            }
+        } catch (error) {
+            console.error("[recognition] Failed to initialize sessions", error);
+            await Promise.all(recognizing.map(async (session) => session.dispose()));
+            await interaction.reply({
+                "content": "エラーが発生しました。",
+                "embeds": [{
+                    "title": "エラー",
+                    "description": "音声認識を開始できませんでした。",
+                    "color": Colors.Red
+                }],
+                "ephemeral": true
+            });
+            return;
+        }
+
         const onVoiceStateUpdate = async (oldState: VoiceState, newState: VoiceState) => {
             if (nrCheck(oldState.guild.id) || nrCheck(newState.guild.id)) return;
             if (nrCheck(oldState.member?.id as string) || nrCheck(newState.member?.id as string)) return;
             if (oldState.guild.id !== interaction.guildId) return;
             if (newState.guild.id !== interaction.guildId) return;
+
+            const recognitionState = voiceChannels.get(interaction.guildId as string)?.recognition;
+            if (!recognitionState) return;
+            const activeVoiceChannel = voiceChannels.get(interaction.guildId as string)?.channel;
+
+            if (!activeVoiceChannel) return;
+
             if (!oldState.channel && newState.channel) {
+                if (newState.channel.id !== activeVoiceChannel.id) return;
                 if (newState.member?.user.bot) return;
-                if (voiceChannels.get(interaction.guildId as string).recognition.recognizing.find((recognizing: { member: GuildMember }) => recognizing.member.id === newState.member?.id)) return;
-                if ((await (interaction.channel as BaseGuildTextChannel).fetchWebhooks()).size >= 10) {
+                if (recognitionState.recognizing.find((session: RecognitionSession) => session.member.id === newState.member?.id)) return;
+                if ((await textChannel.fetchWebhooks()).size >= 10) {
                     await interaction.followUp({
                         "content": "エラーが発生しました。",
                         "embeds": [{
@@ -597,32 +677,34 @@ interactionCommands.set("speech", async (interaction: ChatInputCommandInteractio
                     });
                     return;
                 }
-                const { webhook, recognizer, voice, filledSilence } = await addSpeechRecognizeMember(newState.member as GuildMember, interaction.guildId as string, interaction.channel as BaseGuildTextChannel);
-                voiceChannels.get(interaction.guildId as string).recognition.recognizing.push({
-                    member: newState.member as GuildMember,
-                    webhook,
-                    recognizer,
-                    voice,
-                    filledSilence
-                });
-                await interaction.followUp({
-                    "content": "音声認識を更新しました。",
-                    "embeds": [{
-                        "title": "音声認識",
-                        "description": "音声認識を更新しました。",
-                        "color": Colors.Green
-                    }]
-                });
+                try {
+                    const session = await createRecognitionSession(recognitionState.engine, newState.member as GuildMember, interaction.guildId as string, textChannel);
+                    recognitionState.recognizing.push(session);
+                    await interaction.followUp({
+                        "content": "音声認識を更新しました。",
+                        "embeds": [{
+                            "title": "音声認識",
+                            "description": "音声認識を更新しました。",
+                            "color": Colors.Green
+                        }]
+                    });
+                } catch (error) {
+                    console.error("[recognition] Failed to add member", error);
+                    await interaction.followUp({
+                        "content": "エラーが発生しました。",
+                        "embeds": [{
+                            "title": "エラー",
+                            "description": "音声認識の追加に失敗しました。",
+                            "color": Colors.Red
+                        }]
+                    });
+                }
             }
+
             if (oldState.channel && !newState.channel) {
+                if (oldState.channel.id !== activeVoiceChannel.id) return;
                 if (oldState.member?.user.bot) return;
-                const recognizingMember = voiceChannels.get(interaction.guildId as string).recognition.recognizing.find((recognizing: { member: GuildMember }) => recognizing.member.id === oldState.member?.id);
-                if (!recognizingMember) return;
-                recognizingMember.voice.destroy();
-                recognizingMember.filledSilence.destroy();
-                recognizingMember.recognizer.free();
-                recognizingMember.webhook.delete();
-                voiceChannels.get(interaction.guildId as string).recognition.recognizing.splice(voiceChannels.get(interaction.guildId as string).recognition.recognizing.indexOf(recognizingMember), 1);
+                await removeRecognitionMember(interaction.guildId as string, oldState.member?.id as string);
                 await interaction.followUp({
                     "content": "音声認識を更新しました。",
                     "embeds": [{
@@ -633,18 +715,19 @@ interactionCommands.set("speech", async (interaction: ChatInputCommandInteractio
                 });
             }
         };
+
         client.on("voiceStateUpdate", onVoiceStateUpdate);
-        voiceChannels.get(interaction.guildId as string).recognition = {
-            "onVoiceStateUpdate": onVoiceStateUpdate,
-            "members": recognitionMembers,
-            "recognizing": recognizing
+        state.recognition = {
+            engine,
+            onVoiceStateUpdate,
+            recognizing,
         };
-        voiceChannels.get(interaction.guildId as string).player.play(soundEffects.enable());
+        state.player.play(soundEffects.enable());
         await interaction.reply({
             "content": "音声認識を開始しました。",
             "embeds": [{
                 "title": "音声認識",
-                "description": "音声認識を開始しました。",
+                "description": `音声認識を開始しました。(エンジン: ${engine.toUpperCase()})`,
                 "color": Colors.Green
             }, {
                 "title": "お知らせ",
